@@ -1,0 +1,415 @@
+{
+  "name": "WhatsApp Lead Receptionist - Local Services (Enhanced Sample)",
+  "nodes": [
+    {
+      "id": "181998de-a3f9-4524-a9dd-822f3ef422b3",
+      "name": "Sticky Note - Setup & Credits",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        40,
+        40
+      ],
+      "parameters": {
+        "height": 340,
+        "width": 620,
+        "color": 4,
+        "content": "## WhatsApp Lead Receptionist — Local Services (Enhanced Sample)\n\n**Flow:** WhatsApp webhook intake -> normalize payload -> score & route -> log every lead -> instant owner alert on Hot -> window-aware auto-reply.\n\n**Setup:** 1) In Meta app, point the WhatsApp webhook to this workflow's URL. 2) Pick your Google Sheet in both Sheets nodes (Leads tab + Errors tab). 3) Set the owner email in the Gmail node. 4) Replace phoneNumberId in both WhatsApp nodes and create/approve the re-engagement template. 5) Edit CONFIG in node 3: vertical pack, business hours, booking link.\n\n**Credits:** Structural patterns (WhatsApp trigger intake, 24h-window template branch) adapted from Zie619/n8n-workflows (MIT, (c) 2025 Zie619) — see LICENSE-BASE-MIT.txt. Scoring/routing/normalization code is original work."
+      }
+    },
+    {
+      "id": "88499d56-5196-4d67-b86c-62e3ebc18a73",
+      "name": "1. Webhook - WhatsApp Intake",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        240,
+        420
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "whatsapp-lead-intake",
+        "options": {}
+      }
+    },
+    {
+      "id": "bbfeef5c-7ede-4880-ac46-f13ce31cf04d",
+      "name": "2. Normalize Payload (Code)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        420
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ============================================================\n// Node: 2. Normalize WhatsApp Payload  (mode: runOnceForAllItems)\n// ------------------------------------------------------------\n// Turns raw WhatsApp webhook traffic into clean lead records.\n// Accepts:\n//   A) WhatsApp Cloud API format  body.entry[].changes[].value.messages[]\n//   B) Flat fallback used by WAHA / Evolution-style gateways:\n//      { messages: [...] } or a single { from, text|body } object\n// Non-message events (delivery / read \"statuses\") are dropped silently.\n// An unreadable payload becomes ONE error item (category \"Error\" later)\n// so the flow logs it instead of crashing mid-run.\n// ============================================================\nconst out = [];\n\nfunction pushMessage(msg, nameHint) {\n  const from = msg.from || msg.remoteJid || msg.phone || '';\n  let text = '';\n  let type = msg.type || 'text';\n  if (msg.text && typeof msg.text.body === 'string') text = msg.text.body;\n  else if (typeof msg.body === 'string') text = msg.body; // WAHA-style flat body\n  else if (msg.image) { type = 'image'; text = msg.image.caption || ''; }\n  else if (msg.video) { type = 'video'; text = msg.video.caption || ''; }\n  else if (msg.document) { type = 'document'; text = msg.document.caption || ''; }\n  else if (msg.audio) { type = 'audio'; }\n  else if (msg.location) { type = 'location'; }\n\n  out.push({\n    json: {\n      leadId: msg.id || (msg.key && msg.key.id) || `gen-${Date.now()}-${out.length}`,\n      phone: String(from),\n      name: nameHint || msg.pushName || '',\n      text: String(text).trim(),\n      msgType: type,\n      hasMedia: ['image', 'video', 'audio', 'document'].includes(type),\n      timestampSec: msg.timestamp ? Number(msg.timestamp) : null,\n      receivedAt: new Date().toISOString(),\n    },\n  });\n}\n\nfor (const item of $input.all()) {\n  const body = (item.json && item.json.body) || item.json || {};\n  try {\n    let messagesFound = 0;\n    let structureSeen = false;\n\n    // --- Format A: WhatsApp Cloud API ---\n    if (Array.isArray(body.entry)) {\n      structureSeen = true;\n      for (const entry of body.entry) {\n        for (const change of entry.changes || []) {\n          const value = change.value || {};\n          const nameByWaId = {};\n          for (const c of value.contacts || []) {\n            nameByWaId[c.wa_id] = (c.profile && c.profile.name) || '';\n          }\n          for (const m of value.messages || []) {\n            pushMessage(m, nameByWaId[m.from] || '');\n            messagesFound++;\n          }\n          // value.statuses = sent/delivered/read receipts -> ignored on purpose\n        }\n      }\n    }\n\n    // --- Format B: flat gateway payloads ---\n    if (messagesFound === 0 && Array.isArray(body.messages)) {\n      structureSeen = true;\n      for (const m of body.messages) { pushMessage(m, ''); messagesFound++; }\n    }\n    if (messagesFound === 0 && !structureSeen && (body.text || body.body || body.from || body.phone)) {\n      pushMessage(\n        { from: body.from || body.phone || '', type: 'text',\n          text: { body: body.text || body.body || '' }, timestamp: body.timestamp },\n        ''\n      );\n      messagesFound++;\n      structureSeen = true;\n    }\n\n    if (!structureSeen) {\n      out.push({\n        json: {\n          _error: 'unrecognized_payload',\n          detail: 'No messages array found in payload keys: ' + Object.keys(body).join(','),\n          receivedAt: new Date().toISOString(),\n        },\n      });\n    }\n    // Recognized structure with zero messages (e.g. status-only webhook)\n    // intentionally produces no item.\n  } catch (e) {\n    out.push({\n      json: {\n        _error: 'parse_exception',\n        detail: String(e && e.message ? e.message : e),\n        receivedAt: new Date().toISOString(),\n      },\n    });\n  }\n}\n\nreturn out;\n"
+      }
+    },
+    {
+      "id": "f345e670-4242-4e05-a31a-d2c768cdbe39",
+      "name": "3. Score & Route (Code)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        420
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ============================================================\n// Node: 3. Score & Route Lead  (mode: runOnceForAllItems)\n// ------------------------------------------------------------\n// Lead scoring + reply routing for LOCAL SERVICE businesses\n// (auto repair / beauty / real estate / hotels), the verticals\n// channel partners actually sell WhatsApp automation to.\n//\n// What this node decides for every incoming WhatsApp lead:\n//   score / category (Hot >= 70, Warm >= 45, Cold) + reasons\n//   within24h  - Meta's 24-hour free-form window still open?\n//   openNow    - inside configured business hours?\n//   replyMode  - \"freeform\" (inside window) or \"template\" (window\n//                expired -> only a pre-approved template may reopen)\n//   replyText  - ready-to-send draft, category + hours aware\n//   action     - alert_owner (Hot) / auto_reply / log_only (Error)\n//\n// >>> BUYER CONFIG: edit the block below per business. <<<\nconst CONFIG = {\n  vertical: 'auto', // auto | beauty | realestate | hotel | generic\n  businessName: 'Your Business Name',\n  openHour: 9,\n  closeHour: 21,\n  tzOffsetHours: 8, // business local time = UTC + this offset\n  bookingLink: 'https://cal.com/your-business',\n};\n\n// Vertical keyword packs. Add the buyer's own language / services here.\nconst PACKS = {\n  auto: {\n    service: ['repair', 'engine', 'brake', 'tire', 'tyre', 'oil change', 'inspection',\n      'diagnostic', 'battery', 'not starting', 'noise', '修车', '刹车', '轮胎', '机油', '保养', '空调'],\n    clarify: 'Could you share your car model and year, and describe the problem?',\n  },\n  beauty: {\n    service: ['haircut', 'hair', 'nails', 'facial', 'massage', 'coloring', 'lash', 'brow',\n      '做头发', '美甲', '美容', '按摩', '染发'],\n    clarify: 'Which service would you like, and what time suits you best?',\n  },\n  realestate: {\n    service: ['viewing', 'rent', 'buy', 'sell', 'bedroom', 'apartment', 'house', 'condo',\n      'lease', '看房', '租房', '买房', '卖房'],\n    clarify: 'How many bedrooms do you need, and which area are you looking at?',\n  },\n  hotel: {\n    service: ['room', 'check-in', 'check in', 'stay', 'suite', 'breakfast',\n      '订房', '住宿', '房间', '入住'],\n    clarify: 'What are your check-in and check-out dates, and how many guests?',\n  },\n  generic: {\n    service: ['service', 'help', 'need', '咨询', '服务'],\n    clarify: 'Could you tell me a bit more about what you need?',\n  },\n};\n\nconst BOOKING = ['book', 'appointment', 'schedule', 'reserve', 'booking', '预约', '预订'];\nconst PRICE = ['price', 'cost', 'how much', 'quote', 'rate', 'charge', '价格', '多少钱', '报价'];\nconst URGENT = ['urgent', 'asap', 'today', 'right now', 'emergency', 'broken', 'leaking',\n  'stuck', '急', '今天', '现在', '马上'];\nconst TIMEFRAME = ['tomorrow', 'this week', 'this weekend', 'tonight', 'next week',\n  '明天', '这周', '今晚', '下周'];\nconst INFOQ = ['open', 'hours', 'where', 'location', 'address', '开门', '几点', '地址', '在哪'];\nconst GREETINGS = ['hi', 'hello', 'hey', 'yo', 'hola', '你好', '您好'];\n\nfunction scoreLead(lead, nowMs) {\n  if (lead._error) {\n    return Object.assign({}, lead, {\n      score: 0, category: 'Error', reasons: [lead._error],\n      within24h: false, openNow: false, replyMode: 'none',\n      replyText: '', action: 'log_only',\n    });\n  }\n\n  const pack = PACKS[CONFIG.vertical] || PACKS.generic;\n  const rawText = lead.text || '';\n  const text = rawText.toLowerCase();\n  const hit = (list) => list.some((w) => text.includes(w));\n\n  let score = 25;\n  const reasons = [];\n  if (hit(BOOKING)) { score += 25; reasons.push('booking intent'); }\n  if (hit(PRICE)) { score += 20; reasons.push('asks price'); }\n  if (hit(URGENT)) { score += 20; reasons.push('urgent'); }\n  if (hit(TIMEFRAME)) { score += 10; reasons.push('timeframe given'); }\n  if (hit(pack.service)) { score += 15; reasons.push('names a service (' + CONFIG.vertical + ')'); }\n  if (hit(INFOQ)) { score += 5; reasons.push('asks hours/location'); }\n  if (rawText.length > 80) { score += 5; reasons.push('detailed message'); }\n  if (CONFIG.vertical === 'auto' && lead.hasMedia) {\n    score += 10; reasons.push('sent media - likely a job photo');\n  }\n\n  // A bare greeting carries no buying signal, however it is phrased.\n  const stripped = text.replace(/[!！。.\\s]/g, '');\n  if (GREETINGS.includes(stripped) || (text.length <= 10 && reasons.length === 0)) {\n    score = Math.min(score, 35);\n    if (!reasons.includes('greeting only')) reasons.push('greeting only');\n  }\n  score = Math.min(score, 100);\n  const category = score >= 70 ? 'Hot' : score >= 45 ? 'Warm' : 'Cold';\n\n  // Meta 24-hour window: free-form replies only within 24h of the\n  // customer's last message; after that a template must reopen it.\n  const within24h = lead.timestampSec\n    ? nowMs - Number(lead.timestampSec) * 1000 < 24 * 3600 * 1000\n    : true; // no timestamp -> webhook just arrived, treat as fresh\n  const replyMode = within24h ? 'freeform' : 'template';\n\n  // Business hours in the business's own timezone.\n  const localHour = new Date(nowMs + CONFIG.tzOffsetHours * 3600 * 1000).getUTCHours();\n  const openNow = localHour >= CONFIG.openHour && localHour < CONFIG.closeHour;\n\n  const first = (lead.name || '').split(' ')[0];\n  const hi = first ? `Hi ${first}! ` : 'Hi! ';\n  let replyText;\n  if (category === 'Hot') {\n    replyText = `${hi}Thanks for reaching out to ${CONFIG.businessName} — this sounds like something we can help with right away. Our team has your message and will confirm shortly. You can also grab a slot here: ${CONFIG.bookingLink}`;\n  } else if (category === 'Warm') {\n    replyText = `${hi}Thanks for messaging ${CONFIG.businessName}. ${pack.clarify} You can also book directly here: ${CONFIG.bookingLink}`;\n  } else {\n    replyText = `${hi}Thanks for messaging ${CONFIG.businessName}. We're open ${CONFIG.openHour}:00–${CONFIG.closeHour}:00. Tell us what you need and we'll get right back to you.`;\n  }\n  if (!openNow) {\n    replyText =\n      `Thanks for messaging ${CONFIG.businessName} — we're currently closed (open ${CONFIG.openHour}:00–${CONFIG.closeHour}:00). ` +\n      (category === 'Hot'\n        ? \"This looks urgent, so we've alerted the owner right away. \"\n        : \"We'll reply first thing when we open. \") +\n      replyText;\n  }\n\n  return Object.assign({}, lead, {\n    score, category, reasons, within24h, openNow, replyMode, replyText,\n    action: category === 'Hot' ? 'alert_owner' : 'auto_reply',\n  });\n}\n\nconst nowMs = Date.now();\nreturn $input.all().map((item) => ({ json: scoreLead(item.json, nowMs) }));\n"
+      }
+    },
+    {
+      "id": "d926079f-95fb-4d51-a5f3-34a3c300d25c",
+      "name": "4. Is Malformed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        960,
+        420
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "cond-error",
+              "leftValue": "={{ $json.category }}",
+              "operator": {
+                "operation": "equals",
+                "type": "string"
+              },
+              "rightValue": "Error"
+            }
+          ],
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          }
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "13efdc57-fd30-4296-ad62-602b3a60f8b7",
+      "name": "5a. Dead-Letter Log (Sheets)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [
+        1200,
+        240
+      ],
+      "parameters": {
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "receivedAt": "={{ $json.receivedAt }}",
+            "_error": "={{ $json._error }}",
+            "detail": "={{ $json.detail }}"
+          }
+        },
+        "documentId": {
+          "__rl": true,
+          "mode": "list",
+          "value": ""
+        },
+        "operation": "append",
+        "options": {},
+        "sheetName": {
+          "__rl": true,
+          "mode": "list",
+          "value": "gid=0"
+        }
+      }
+    },
+    {
+      "id": "4f957dab-c260-4a90-ba95-5af6b2b347b9",
+      "name": "5b. Log Lead (Sheets)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [
+        1200,
+        460
+      ],
+      "parameters": {
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "receivedAt": "={{ $json.receivedAt }}",
+            "leadId": "={{ $json.leadId }}",
+            "phone": "={{ $json.phone }}",
+            "name": "={{ $json.name }}",
+            "text": "={{ $json.text }}",
+            "msgType": "={{ $json.msgType }}",
+            "score": "={{ $json.score }}",
+            "category": "={{ $json.category }}",
+            "within24h": "={{ $json.within24h }}",
+            "openNow": "={{ $json.openNow }}",
+            "replyMode": "={{ $json.replyMode }}",
+            "action": "={{ $json.action }}",
+            "reasons": "={{ $json.reasons.join('; ') }}"
+          }
+        },
+        "documentId": {
+          "__rl": true,
+          "mode": "list",
+          "value": ""
+        },
+        "operation": "append",
+        "options": {},
+        "sheetName": {
+          "__rl": true,
+          "mode": "list",
+          "value": "gid=0"
+        }
+      }
+    },
+    {
+      "id": "5f0bfeb1-ade5-44a6-9cc7-ea024a78f88f",
+      "name": "6. Is Hot Lead?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        660
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "cond-hot",
+              "leftValue": "={{ $json.category }}",
+              "operator": {
+                "operation": "equals",
+                "type": "string"
+              },
+              "rightValue": "Hot"
+            }
+          ],
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          }
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "201807ec-4f3c-4d65-bb72-8be397e70629",
+      "name": "7. Owner Alert (Gmail)",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        660
+      ],
+      "parameters": {
+        "sendTo": "owner@example.com",
+        "emailType": "text",
+        "subject": "=🔥 Hot WhatsApp lead: {{ $json.name }} (score {{ $json.score }})",
+        "message": "=A hot lead just messaged on WhatsApp.\n\nName: {{ $json.name }}\nPhone: {{ $json.phone }}\nScore: {{ $json.score }} ({{ $json.reasons.join('; ') }})\nBusiness open now: {{ $json.openNow }}\n\nMessage:\n{{ $json.text }}\n\nFull log is in the Leads sheet. Reply on WhatsApp within the 24h window.",
+        "options": {}
+      }
+    },
+    {
+      "id": "7ea68a2d-db48-48ae-a530-1919da3e2452",
+      "name": "8. Reply Mode (Switch)",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        1200,
+        880
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "id": "sw-freeform",
+                    "leftValue": "={{ $json.replyMode }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "freeform"
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "freeform"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "id": "sw-template",
+                    "leftValue": "={{ $json.replyMode }}",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "rightValue": "template"
+                  }
+                ]
+              },
+              "renameOutput": true,
+              "outputKey": "template"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "b3cb358c-4359-4954-86d6-a287ce898d1c",
+      "name": "9a. Send Text Reply (WhatsApp)",
+      "type": "n8n-nodes-base.whatsApp",
+      "typeVersion": 1,
+      "position": [
+        1440,
+        820
+      ],
+      "parameters": {
+        "operation": "send",
+        "textBody": "={{ $json.replyText }}",
+        "phoneNumberId": "REPLACE_WITH_PHONE_NUMBER_ID",
+        "recipientPhoneNumber": "={{ $json.phone }}",
+        "additionalFields": {},
+        "requestOptions": {}
+      }
+    },
+    {
+      "id": "7fe37468-d271-4748-b23a-c76632d76ae0",
+      "name": "9b. Send Template - Reopen Window (WhatsApp)",
+      "type": "n8n-nodes-base.whatsApp",
+      "typeVersion": 1,
+      "position": [
+        1440,
+        1020
+      ],
+      "parameters": {
+        "template": "lead_followup|en_US",
+        "phoneNumberId": "REPLACE_WITH_PHONE_NUMBER_ID",
+        "recipientPhoneNumber": "={{ $json.phone }}",
+        "requestOptions": {}
+      }
+    }
+  ],
+  "connections": {
+    "1. Webhook - WhatsApp Intake": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "2. Normalize Payload (Code)",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "2. Normalize Payload (Code)": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "3. Score & Route (Code)",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "3. Score & Route (Code)": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "4. Is Malformed?",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "4. Is Malformed?": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "5a. Dead-Letter Log (Sheets)",
+            "type": "main"
+          }
+        ],
+        [
+          {
+            "index": 0,
+            "node": "5b. Log Lead (Sheets)",
+            "type": "main"
+          },
+          {
+            "index": 0,
+            "node": "6. Is Hot Lead?",
+            "type": "main"
+          },
+          {
+            "index": 0,
+            "node": "8. Reply Mode (Switch)",
+            "type": "main"
+          }
+        ]
+      ]
+    },
+    "6. Is Hot Lead?": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "7. Owner Alert (Gmail)",
+            "type": "main"
+          }
+        ],
+        []
+      ]
+    },
+    "8. Reply Mode (Switch)": {
+      "main": [
+        [
+          {
+            "index": 0,
+            "node": "9a. Send Text Reply (WhatsApp)",
+            "type": "main"
+          }
+        ],
+        [
+          {
+            "index": 0,
+            "node": "9b. Send Template - Reopen Window (WhatsApp)",
+            "type": "main"
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "_notes": "Enhanced sample built 2026-10-23. Base patterns adapted from Zie619/n8n-workflows (MIT License, Copyright (c) 2025 Zie619): WhatsApp trigger intake shape and the 24h-window/template-reopen branch idea (files workflows/Whatsapp/1521_*.json, 2030_*.json). Everything else - payload normalization, vertical lead scoring, business-hours routing, dead-letter error handling, reply drafting - is original code. On import: connect Google Sheets (Leads + Errors tabs) and Gmail credentials, set owner email, replace phoneNumberId in both WhatsApp nodes, create the 'lead_followup' template in Meta, and edit CONFIG in node 3 (vertical / hours / booking link). Sheets/Gmail/WhatsApp nodes are structurally validated only; the two Code nodes are unit-tested locally (see test/run_tests.js)."
+}
